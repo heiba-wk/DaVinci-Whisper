@@ -1,0 +1,22 @@
+# Whisper model weights are distributed separately.
+**/model.bin
+
+# Runtime credentials and sessions.
+**/config/supabase_session_*.json
+**/config/*.tmp-*
+
+# Generated media and subtitle files.
+**/audio_temp/
+**/sub_temp/
+
+# Python caches and local environments.
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and OS metadata.
+.DS_Store
+.idea/
+.vscode/
+

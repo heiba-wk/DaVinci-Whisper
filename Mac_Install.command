@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Request administrator privileges
+if [ "$EUID" -ne 0 ]; then
+  echo "Requesting administrator privileges. Please enter your password:"
+  exec sudo "$0" "$@"
+  exit
+fi
+# ===== Variables =====
+SCRIPT_NAME="DaVinci Whisper"
+
+UTILITY_DIR="/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
+
+WHEEL_DIR="/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/HB/$SCRIPT_NAME/wheel"
+TARGET_DIR="/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/HB/$SCRIPT_NAME/Lib"
+
+# Official and mirror PyPI indexes
+PIP_OFFICIAL="https://pypi.org/simple"
+PIP_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
+
+# ===== Region detection (prefer mirror in CN) =====
+read_user_default() {
+  local key="$1"
+  local val=""
+  if [[ -n "${SUDO_USER-}" ]]; then
+    val=$(sudo -u "$SUDO_USER" defaults read -g "$key" 2>/dev/null || true)
+  else
+    val=$(defaults read -g "$key" 2>/dev/null || true)
+  fi
+  echo "$val"
+}
+
+is_china_region() {
+  local locale langs tz country
+  locale="$(read_user_default AppleLocale)"
+  langs="$(read_user_default AppleLanguages)"
+  if [[ "$locale" == *"zh_CN"* || "$locale" == *"Hans_CN"* ]]; then
+    return 0
+  fi
+  if [[ "$langs" == *"zh-Hans"* || "$langs" == *"zh_CN"* ]]; then
+    return 0
+  fi
+  if command -v systemsetup >/dev/null 2>&1; then
+    tz="$(systemsetup -gettimezone 2>/dev/null | awk -F': ' '{print $2}')"
+    if [[ "$tz" == "Asia/Shanghai" || "$tz" == "Asia/Urumqi" ]]; then
+      return 0
+    fi
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    country="$(
+      curl -m 2 -s https://ipinfo.io/country 2>/dev/null || \
+      curl -m 2 -s https://ifconfig.co/country-iso 2>/dev/null || true
+    )"
+    country="${country//[$'\r\n\t ']}"
+    if [[ "$country" == "CN" ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# ===== Logging =====
+# Usage: log LEVEL "message"
+# LEVEL: INFO, WARN, ERROR, SUCCESS
+log() {
+  local level="$1"; shift
+  local msg="$*"
+  local ts
+  ts=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "[$ts][$level] $msg"
+}
+
+select_python() {
+  local candidate version path_python
+  local candidates=(
+    "/Library/Frameworks/Python.framework/Versions/Current/bin/python3"
+    "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
+    "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11"
+    "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10"
+    "/Library/Frameworks/Python.framework/Versions/3.9/bin/python3.9"
+  )
+
+  path_python="$(command -v python3 2>/dev/null || true)"
+  if [[ -n "$path_python" ]]; then
+    candidates+=("$path_python")
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    [[ -x "$candidate" ]] || continue
+    version="$("$candidate" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
+    case "$version" in
+      3.9|3.10|3.11|3.12)
+        PYTHON="$candidate"
+        PYTHON_VERSION="$version"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+if ! select_python; then
+  log ERROR "Python 3.9-3.12 was not found. Install Python 3.12 from python.org, then run this installer again."
+  exit 1
+fi
+
+log INFO "Selected Python $PYTHON_VERSION: $PYTHON"
+log INFO "Starting offline download and installation of dependencies."
+
+# Step 1: Copy local script folder into Resolve Utility
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE_DIR="$SCRIPT_DIR/$SCRIPT_NAME"
+log INFO "Ensuring Utility scripts directory: $UTILITY_DIR"
+mkdir -p "$UTILITY_DIR"
+if [ -d "$SOURCE_DIR" ]; then
+  if [ -d "$UTILITY_DIR/$SCRIPT_NAME" ]; then
+    # 目标已存在时，使用 rsync 跳过 model 文件夹，保留用户已下载的模型
+    log INFO "Target exists: $UTILITY_DIR/$SCRIPT_NAME. Updating while preserving model folder..."
+    if rsync -a --exclude='model/' "$SOURCE_DIR/" "$UTILITY_DIR/$SCRIPT_NAME/"; then
+      log SUCCESS "Folder updated (model folder preserved)."
+    else
+      log ERROR "Failed to update folder. Please copy it manually."
+    fi
+  else
+    # 目标不存在时，直接完整复制
+    log INFO "Copying \"$SOURCE_DIR\" to \"$UTILITY_DIR/$SCRIPT_NAME\""
+    if ditto "$SOURCE_DIR" "$UTILITY_DIR/$SCRIPT_NAME"; then
+      log SUCCESS "Folder copied to Utility scripts."
+    else
+      log ERROR "Failed to copy folder. Please copy it manually."
+    fi
+  fi
+else
+  log WARN "Source folder not found next to this script: $SOURCE_DIR"
+fi
+
+# Step 2: Prepare wheel download directory
+log INFO "Preparing wheel download directory: $WHEEL_DIR"
+mkdir -p "$WHEEL_DIR"
+
+# Step 3: Clear pip cache (optional)
+log INFO "Clearing pip cache..."
+"$PYTHON" -m pip cache purge >/dev/null 2>&1 || log WARN "pip cache purge failed or already empty."
+
+# Step 4: Download packages and dependencies
+PRIMARY_INDEX="$PIP_OFFICIAL"; SECONDARY_INDEX="$PIP_MIRROR"
+if is_china_region; then
+  PRIMARY_INDEX="$PIP_MIRROR"; SECONDARY_INDEX="$PIP_OFFICIAL"
+  log INFO "Region CN detected. Using mirror first: $PRIMARY_INDEX"
+else
+  log INFO "Region not CN. Using official first: $PRIMARY_INDEX"
+fi
+
+# 分两步下载：二进制包 + 纯 Python 包（jieba）
+BINARY_PACKAGES=(
+  "faster_whisper==1.1.1"
+  "requests"
+  "regex"
+)
+PURE_PYTHON_PACKAGES=(
+  "jieba"
+)
+
+# 下载二进制包
+if "$PYTHON" -m pip download "${BINARY_PACKAGES[@]}" \
+    --dest "$WHEEL_DIR" \
+    --only-binary=:all: \
+    --use-feature=fast-deps \
+    --no-cache-dir \
+    --progress-bar=on \
+    -i "$PRIMARY_INDEX"; then
+  log SUCCESS "Binary packages downloaded from primary index."
+else
+  log WARN "Primary index failed for binary packages. Trying secondary: $SECONDARY_INDEX ..."
+  if "$PYTHON" -m pip download "${BINARY_PACKAGES[@]}" \
+      --dest "$WHEEL_DIR" \
+      --only-binary=:all: \
+      --use-feature=fast-deps \
+      --no-cache-dir \
+      --progress-bar=on \
+      -i "$SECONDARY_INDEX"; then
+    log SUCCESS "Binary packages downloaded from secondary index."
+  else
+    log ERROR "Binary packages download failed from both indexes."
+    exit 1
+  fi
+fi
+
+# 下载纯 Python 包（不使用 --only-binary）
+log INFO "Downloading pure Python packages (jieba)..."
+if "$PYTHON" -m pip download "${PURE_PYTHON_PACKAGES[@]}" \
+    --dest "$WHEEL_DIR" \
+    --no-cache-dir \
+    --progress-bar=on \
+    -i "$PRIMARY_INDEX"; then
+  log SUCCESS "Pure Python packages downloaded from primary index."
+else
+  log WARN "Primary index failed for jieba. Trying secondary: $SECONDARY_INDEX ..."
+  if "$PYTHON" -m pip download "${PURE_PYTHON_PACKAGES[@]}" \
+      --dest "$WHEEL_DIR" \
+      --no-cache-dir \
+      --progress-bar=on \
+      -i "$SECONDARY_INDEX"; then
+    log SUCCESS "Pure Python packages downloaded from secondary index."
+  else
+    log WARN "jieba download failed. It will be installed separately if needed."
+  fi
+fi
+
+# Step 5: Create target directory & fix ownership
+log INFO "Preparing target installation directory: $TARGET_DIR"
+sudo mkdir -p "$TARGET_DIR"
+INSTALL_USER="${SUDO_USER:-$(id -un)}"
+sudo chown -R "$INSTALL_USER" "$TARGET_DIR"
+log SUCCESS "Target directory ready and owned by $INSTALL_USER."
+
+# Step 6: Offline install specified packages and dependencies
+log INFO "Installing specified packages offline..."
+ALL_PACKAGES=("${BINARY_PACKAGES[@]}" "${PURE_PYTHON_PACKAGES[@]}")
+if "$PYTHON" -m pip install "${ALL_PACKAGES[@]}" \
+     --no-index \
+     --find-links "$WHEEL_DIR" \
+     --target "$TARGET_DIR" \
+     --upgrade \
+     --force-reinstall; then
+  log SUCCESS "Successfully installed specified packages and their dependencies."
+else
+  log ERROR "Offline installation of specified packages failed. Please check wheels and permissions."
+  exit 1
+fi
+
+# Step 7: Verify native and Python dependencies with the selected interpreter
+log INFO "Verifying dependency imports with Python $PYTHON_VERSION..."
+if "$PYTHON" -c 'import sys; sys.path.insert(0, sys.argv[1]); import requests, regex, faster_whisper, jieba; print(f"regex: {regex.__file__}"); print(f"faster_whisper: {faster_whisper.__file__}")' "$TARGET_DIR"; then
+  log SUCCESS "Dependency import verification passed."
+else
+  log ERROR "Dependency verification failed. Resolve would not be able to start DaVinci Whisper with this installation."
+  exit 1
+fi
+
+# Step 8: Summary
+log INFO "Installation process completed. Please verify modules in $TARGET_DIR."
+log SUCCESS "All done. Fully quit and reopen DaVinci Resolve before using DaVinci Whisper."
